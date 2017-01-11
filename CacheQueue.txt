@@ -1,0 +1,480 @@
+//HANNAH PEDERSEN, HBP243
+/* 
+ * cachelab.c - A cache simulator that can replay traces of memory accesses
+ *     and output statistics such as number of hits, misses, and
+ *     evictions.  The replacement policy is LRU.
+ *
+ * Implementation and assumptions:
+ *  1. Each load/store can cause at most one cache miss. (I examined the trace,
+ *  the largest request I saw was for 8 bytes).
+ *  2. Instruction loads (I) are ignored.
+ *  3. data modify (M) is treated as a load followed by a store to the same
+ *  address. Hence, an M operation can result in two cache hits, or a miss and a
+ *  hit plus a possible eviction. 
+ */
+#include <getopt.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
+#include <string.h>
+#include <errno.h>
+
+//#define DEBUG_ON 
+#define ADDRESS_LENGTH 64
+
+/* Type: Memory address */
+typedef unsigned long long int mem_addr_t;
+
+/**************************************************************************/
+/* Declarations of the functions currently implemented in this file */
+
+/* 
+ * printSummary - This function provides a standard way for your cache
+ * simulator * to display its final hit and miss statistics
+ */ 
+void printSummary(int hits,  /* number of  hits */
+				  int misses, /* number of misses */
+				  int evictions); /* number of evictions */
+
+/*
+ * replayTrace - replays the given trace file against the cache 
+ */
+void replayTrace(char* trace_fn);
+
+/* 
+ * accessData - Access data at memory address addr. 
+ * This is the one that you need to implement.
+ */
+void accessData(mem_addr_t addr);
+
+/*
+ * printUsage - Print usage info
+ */
+void printUsage(char* argv[]);
+/**************************************************************************/
+
+
+/**************************************************************************/
+/* Declarations of the global variable currently used. */
+/* Do NOT modify any of the following globals. 
+ * But you can add your own globals if you want 
+ */
+/* Globals set by command line args */
+int s = 0; /* set index bits */ //2^s is number of sets
+int b = 0; /* block offset bits */
+int E = 0; /* associativity */ //number of blocks 
+
+char* trace_file = NULL;
+
+/* Counters used to record cache statistics */
+int miss_count = 0;     /* cache miss */
+int hit_count = 0;      /* cache hit */
+int eviction_count = 0; /* A block is evicted from the cache */
+/**************************************************************************/
+
+
+/* 
+ * accessData - Access data at memory address addr.
+ *   If it is already in cache, increast hit_count
+ *   If it is not in cache, bring it in cache, increase miss count.
+ *   Also increase eviction_count if a line is evicted.
+ * 
+ *   If you need to evict a line (i.e. block) apply least recently used 
+ *   replacement policy.
+ */
+
+//STRUCT DEFINITIONS BELOW
+//___________________________________________________________________________________________________________________________________
+typedef struct Address
+{
+   long TAG;
+   long INDEX;
+} Address;
+
+typedef struct QNode
+{
+    int validBit;
+     Address* address; //each QNode holds a tag, index, and offset
+    struct QNode *prev, *next;
+} QNode;
+ 
+typedef struct Queue
+{
+    unsigned count;  // Number of filled blocks in the queue
+    unsigned numberOfBlocks; // number of blocks allowed at each set
+    QNode *front, *rear;
+} Queue;
+
+typedef struct setObject
+{
+   int capacity;
+   Queue* queue;
+} setObject; //need to create constructor for setObject
+
+typedef struct Hash
+{
+    int capacity; // how many sets can there be
+    setObject ** arrayOfSets;
+} Hash;
+
+//GLOBAL VARIABLES I ADDED BELOW
+//_______________________________________________________________________________________________________________________________
+Hash *theHash = NULL;
+
+//ALL QUEUE FUNCTIONS BELOW INCLUDING ADDRESS
+//____________________________________________________________________________________________________________________________________
+Address* createAddress(long tag, long index)
+{
+     Address *temp = (Address *)malloc(sizeof(Address));
+    temp->TAG =tag;
+    temp->INDEX =index;
+     return temp;
+}
+
+QNode* newQNode(  Address * addr )
+{
+    QNode* temp = (QNode *)malloc( sizeof( QNode ) );
+    temp->address = addr;
+    temp->validBit = 0; //not valid to begin with;
+    temp->prev = temp->next = NULL;
+ 
+    return temp;
+}
+ 
+Queue* createQueue( int numberOfBlocks )
+{
+    Queue* queue = (Queue *)malloc( sizeof( Queue ) );
+    queue->count = 0;
+    queue->front = queue->rear = NULL;
+    queue->numberOfBlocks = numberOfBlocks;
+ 
+    return queue;
+}
+
+int AreAllFramesFull( Queue* queue )
+{
+    return queue->count == queue->numberOfBlocks;
+}
+
+int isQueueEmpty( Queue* queue )
+{
+    return queue->rear == NULL;
+}
+ 
+void deQueue( Queue* queue )
+{
+  eviction_count++; //kicking a block out
+   //if only one element, now it's empty
+    if (queue->front == queue->rear)
+        queue->front = NULL;
+ 
+    // Change rear and remove the previous rear
+    QNode* temp = queue->rear;
+    temp->validBit = 0; //no longer valid
+    queue->rear = queue->rear->prev;
+ 
+    if (queue->rear)
+        queue->rear->next = NULL;
+ 
+    free( temp );
+ 
+    // decrement the number of full frames by 1
+    queue->count--;
+}
+ 
+void Enqueue( Queue* queue, Address * addr)
+{
+    miss_count ++; //no node was here, so had to be added
+    if ( AreAllFramesFull ( queue ) )
+    {
+        deQueue( queue ); //this incraments eviction count
+    }
+    
+    QNode* temp = newQNode(addr);
+    temp->next = queue->front;
+ 
+    if ( isQueueEmpty( queue ) )
+        queue->rear = queue->front = temp;
+    else  
+    {
+        queue->front->prev = temp;
+        queue->front = temp;
+    }
+    temp->validBit = 1;  //ITEM IS IN THE QUEUE SO VALIDATE BIT
+    queue->count++;
+}
+
+void printQueue(Queue *queue) {
+	QNode *node = queue->front;
+        
+	while(node) {
+		printf("%ld ",node->address->TAG);
+		node = node->next;
+	}
+	printf("no more queue elements \n");
+}
+
+void moveToEnd(Queue *queue, QNode *node) {
+	// If node is not already rear (last node) of queue
+	if (node != queue->front)
+        {
+           node->prev->next = node->next;
+           if(node->next)
+           {
+             node->next->prev = node->prev;
+            }
+           if(node == queue->rear)
+           {
+             queue->rear = node->prev;
+              queue->rear->next = NULL;
+            }
+           node->next = queue->front;
+           node->prev = NULL;
+       
+           node->next->prev = node;
+           queue->front = node;
+         }
+
+}
+
+
+//ALL SET OBJECT FUNCTIONS BELOW
+//_____________________________________________________________________________________________________________________________________
+setObject *newSetObject(unsigned capacity)
+{
+   setObject *temp = (setObject *) malloc(sizeof(setObject) );
+  Queue *q =createQueue(capacity);
+   temp->queue = q;
+
+    return temp;
+}
+
+void addItemToSet(setObject * set, Address * addr)
+{
+   Enqueue(set->queue, addr);
+}
+
+void printSet(setObject *set)
+{
+   printQueue(set->queue);
+}
+
+//ALL HASH FUNCTIONS BELOW
+//_____________________________________________________________________________________________________________________________________
+Hash* createHash( long capacity, int numOfBlocks)
+{
+    // Allocate memory for hash
+    Hash* hash = (Hash *) malloc( sizeof( Hash ) );
+    hash->capacity = capacity;
+    hash->arrayOfSets = (setObject **) malloc (capacity *sizeof(setObject*)  ); //gets memory
+    int i;
+    for( i = 0; i < hash->capacity; ++i )
+      {
+        hash->arrayOfSets[i] = newSetObject(numOfBlocks);  
+    }
+    return hash;
+}
+
+void addElement(Address *addr)
+{
+  long setNumber = (addr->INDEX % theHash->capacity);
+  setObject *set = theHash->arrayOfSets[setNumber];
+  addItemToSet(set, addr);
+
+}
+
+void printHash()
+{
+int i;
+for(i =0; i< theHash->capacity; ++i){
+     printf("currently printing for line %d of hash\n", i);
+     setObject *set = theHash->arrayOfSets[i];
+     printSet(set);
+     printf("\n");
+}
+}
+
+//REAL LAB FUNCTIONS BELOW
+//_____________________________________________________________________________________________________________________________
+
+void IsTagInQueue(Queue *q, Address * addr)
+{
+
+     QNode *node = q->front;
+       int wasFound = 0;
+	while(node) {
+                //printf("inside while loop with node %ld\n", node->address->TAG);
+		if(node->address->TAG == addr->TAG){ //if that node's tag equals the tag being passed in
+                     if (node->validBit == 1){ //tag matches and it's valid
+                                wasFound =1;
+                                 hit_count++; //we have a hit
+                                moveToEnd(q, node); //switch LRU queue
+                      }else{
+                              printf("valid bit was not true\n miss.");
+        
+                      }
+                 }
+		node = node->next;
+	}
+      if (wasFound == 0){
+        Enqueue(q, addr);
+       }
+}
+
+void isAddressInHash(Address *addr) //returns 0 if no, 1 if yes
+{
+     int correctSet = (addr->INDEX % theHash->capacity) ;
+
+     Queue *q = theHash->arrayOfSets[correctSet]->queue;
+
+     //if the queue at that set is empty, then there is a miss and it must be added     
+     if(isQueueEmpty(q)){
+              Enqueue(q, addr);
+      } else{ //there's something in that set
+
+     //IsTagInQueue will look for it, check valid bit, incrament hit_count, and Enqueue if necessary
+     IsTagInQueue(q, addr);
+     }
+
+}
+
+
+
+//BELOW IS MAIN AND BUILD IN ACCESS DATA
+//_____________________________________________________________________________________________________________________________
+#define LAST(k,n) ((k) & ((1<<(n))-1));
+
+void accessData(mem_addr_t addr)
+{
+   long int addressCopy = addr;
+   addr = addr >> b; //remove offset bits
+
+   long index = LAST(addr, (s));
+   long tag = addressCopy >> (b+s);
+
+//create address object, which will live inside a QNode
+   Address *theAddr = createAddress(tag, index);
+  isAddressInHash(theAddr);
+
+  
+ }
+
+
+
+
+/*
+ * main - Main routine 
+ */
+int main(int argc, char* argv[])
+{
+    char c;
+
+    /* Do NOT modify anything from this point till the following comment */
+    while( (c=getopt(argc,argv,"s:E:b:t:vh")) != -1){
+        switch(c){
+        case 's':
+            s = atoi(optarg);
+            break;
+        case 'E':
+            E = atoi(optarg);
+            break;
+        case 'b':
+            b = atoi(optarg);
+            break;
+        case 't':
+            trace_file = optarg;
+            break;
+        case 'h':
+            printUsage(argv);
+            exit(0);
+        default:
+            printUsage(argv);
+            exit(1);
+        }
+    }
+
+    /* Make sure that all required command line args were specified */
+    if (s == 0 || E == 0 || b == 0 || trace_file == NULL) {
+        printf("%s: Missing required command line argument\n", argv[0]);
+        printUsage(argv);
+        exit(1);
+    }
+    /* From here you can make any modification, 
+     * except removing the call to replayTrace */
+    
+//initalize global hash with 2^s sets and E blocks per set 
+    long numOfSets = pow(2, s);
+    theHash = createHash(numOfSets, E);
+
+    /* Do not remove this line as it is the one calls your cache access function */
+    replayTrace(trace_file);
+    
+  
+    /* Do not modify anything from here till end of main() function */
+    printSummary(hit_count, miss_count, eviction_count);
+    return 0;
+}
+
+
+/****** Do NOT modify anything below this point ******/
+
+/* 
+ * printSummary - Summarize the cache simulation statistics. Student cache simulators
+ *                must call this function in order to be properly autograded. 
+ */
+void printSummary(int hits, int misses, int evictions)
+{
+    printf("hits:%d misses:%d evictions:%d\n", hits, misses, evictions);
+    
+}
+
+/*
+ * printUsage - Print usage info
+ */
+void printUsage(char* argv[])
+{
+    printf("Usage: %s [-hv] -s <num> -E <num> -b <num> -t <file>\n", argv[0]);
+    printf("Options:\n");
+    printf("  -h         Print this help message.\n");
+    printf("  -s <num>   Number of set index bits.\n");
+    printf("  -E <num>   Number of blocks per set (i.e. associativity).\n");
+    printf("  -b <num>   Number of block offset bits.\n");
+    printf("  -t <file>  Trace file.\n");
+    printf("\nExamples:\n");
+    printf("  linux>  %s -s 4 -E 1 -b 4 -t ls.trace\n", argv[0]);
+    exit(0);
+}
+
+/*
+ * replayTrace - replays the given trace file against the cache 
+ */
+void replayTrace(char* trace_fn)
+{
+    char buf[1000];
+    mem_addr_t addr=0;
+    unsigned int len=0;
+    FILE* trace_fp = fopen(trace_fn, "r");
+
+    if(!trace_fp){
+        fprintf(stderr, "%s: %s\n", trace_fn, strerror(errno));
+        exit(1);
+    }
+
+    while( fgets(buf, 1000, trace_fp) != NULL) {
+        if(buf[1]=='S' || buf[1]=='L' || buf[1]=='M') {
+            sscanf(buf+3, "%llx,%u", &addr, &len);
+
+            accessData(addr);
+
+            /* If the instruction is R/W then access again */
+            if(buf[1]=='M')
+                accessData(addr);
+            
+        }
+    }
+
+    fclose(trace_fp);
+}
